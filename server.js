@@ -10,9 +10,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // MongoDB connection
-const MONGO_URI = 'mongodb://localhost:27017';
-const DB_NAME = 'todoCalendar';
-const COLLECTION_NAME = 'tasks';
+const MONGO_URI = process.env.MONGO_URI;
+const DB_NAME = process.env.DB_NAME;
+const COLLECTION_NAME = process.env.COLLECTION_NAME;
 
 // Google OAuth client
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'your-google-client-id.apps.googleusercontent.com';
