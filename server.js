@@ -29,7 +29,17 @@ app.use(express.json());
 // Connect to MongoDB
 async function connectToMongoDB() {
   try {
-    const client = new MongoClient(MONGO_URI);
+    const client = new MongoClient(MONGO_URI, {
+      tls: true,
+      serverSelectionTimeoutMS: 30000,
+      connectTimeoutMS: 30000,
+      socketTimeoutMS: 30000,
+      maxPoolSize: 10,
+      minPoolSize: 5,
+      maxIdleTimeMS: 30000,
+      retryWrites: true,
+      writeConcern: { w: 'majority' }
+    });
     await client.connect();
     console.log('Connected to MongoDB successfully');
     
