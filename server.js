@@ -5,6 +5,8 @@ const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
+const https = require('https');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,6 +23,7 @@ const client = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 let db;
 let tasksCollection;
+let usersCollection;
 
 // Middleware
 app.use(cors({
@@ -50,14 +53,120 @@ async function connectToMongoDB() {
     
     db = client.db(DB_NAME);
     tasksCollection = db.collection(COLLECTION_NAME);
+    usersCollection = db.collection('users');
     
     // Create indexes for better performance
     await tasksCollection.createIndex({ dateKey: 1, userId: 1 });
     await tasksCollection.createIndex({ "task.id": 1, userId: 1 });
     await tasksCollection.createIndex({ userId: 1 });
+    await usersCollection.createIndex({ userId: 1 }, { unique: true });
   } catch (error) {
     console.error('Error connecting to MongoDB:', error);
     process.exit(1);
+  }
+}
+
+// Helper function to download and store user profile image
+async function downloadAndStoreImage(imageUrl, userId) {
+  return new Promise((resolve, reject) => {
+    if (!imageUrl) {
+      console.log('No image URL provided for user:', userId);
+      resolve(null);
+      return;
+    }
+
+    console.log('Downloading image for user:', userId, 'from:', imageUrl);
+    
+    https.get(imageUrl, (response) => {
+      if (response.statusCode !== 200) {
+        console.error('Failed to download image:', response.statusCode, 'for user:', userId);
+        resolve(null);
+        return;
+      }
+
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        try {
+          const imageBuffer = Buffer.concat(chunks);
+          const imageHash = crypto.createHash('md5').update(imageBuffer).digest('hex');
+          
+          console.log('Image downloaded successfully for user:', userId, 'Size:', imageBuffer.length, 'bytes');
+          
+          resolve({
+            data: imageBuffer,
+            contentType: response.headers['content-type'] || 'image/jpeg',
+            hash: imageHash,
+            size: imageBuffer.length
+          });
+        } catch (error) {
+          console.error('Error processing image for user:', userId, error);
+          resolve(null);
+        }
+      });
+    }).on('error', (error) => {
+      console.error('Error downloading image for user:', userId, error);
+      resolve(null);
+    });
+  });
+}
+
+// Helper function to get or create user profile
+async function getOrCreateUserProfile(userPayload) {
+  try {
+    const userId = userPayload.sub;
+    let userProfile = await usersCollection.findOne({ userId });
+
+    if (!userProfile) {
+      // New user - download and store profile image
+      console.log('Creating new user profile for:', userPayload.email);
+      
+      const imageData = await downloadAndStoreImage(userPayload.picture, userId);
+      
+      userProfile = {
+        userId,
+        email: userPayload.email,
+        name: userPayload.name,
+        profileImage: imageData,
+        googlePictureUrl: userPayload.picture,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      await usersCollection.insertOne(userProfile);
+      console.log('User profile created successfully');
+    } else {
+      // Existing user - check if we need to update the profile image
+      const shouldUpdateImage = !userProfile.profileImage || 
+                               userProfile.googlePictureUrl !== userPayload.picture;
+
+      if (shouldUpdateImage && userPayload.picture) {
+        console.log('Updating profile image for user:', userPayload.email);
+        
+        const imageData = await downloadAndStoreImage(userPayload.picture, userId);
+        
+        await usersCollection.updateOne(
+          { userId },
+          {
+            $set: {
+              name: userPayload.name,
+              email: userPayload.email,
+              profileImage: imageData,
+              googlePictureUrl: userPayload.picture,
+              updatedAt: new Date()
+            }
+          }
+        );
+        
+        userProfile.profileImage = imageData;
+        console.log('Profile image updated successfully');
+      }
+    }
+
+    return userProfile;
+  } catch (error) {
+    console.error('Error managing user profile:', error);
+    return null;
   }
 }
 
@@ -78,11 +187,16 @@ async function authenticateToken(req, res, next) {
     });
     
     const payload = ticket.getPayload();
+    
+    // Get or create user profile with stored image
+    const userProfile = await getOrCreateUserProfile(payload);
+    
     req.user = {
       id: payload.sub,
       email: payload.email,
       name: payload.name,
-      picture: payload.picture
+      picture: userProfile?.profileImage ? `/api/user/image/${userProfile.userId}` : payload.picture,
+      hasStoredImage: !!userProfile?.profileImage
     };
     
     next();
@@ -279,6 +393,55 @@ app.post('/api/auth/verify', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error verifying user:', error);
     res.status(500).json({ error: 'Failed to verify user' });
+  }
+});
+
+// GET /api/user/image/:userId - Serve user profile image
+app.get('/api/user/image/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    console.log('Serving image for user:', userId);
+    console.log('Database name:', DB_NAME);
+    console.log('Users collection initialized:', !!usersCollection);
+    
+    // Debug: List all users in collection
+    const allUsers = await usersCollection.find({}).toArray();
+    console.log('All users in collection:', allUsers.length);
+    allUsers.forEach(user => {
+      console.log('User ID in DB:', user.userId, 'Has image:', !!user.profileImage);
+    });
+    
+    const userProfile = await usersCollection.findOne({ userId });
+    
+    if (!userProfile) {
+      console.log('User profile not found for:', userId);
+      return res.status(404).json({ error: 'User profile not found' });
+    }
+    
+    if (!userProfile.profileImage) {
+      console.log('Profile image not found for user:', userId);
+      return res.status(404).json({ error: 'Profile image not found' });
+    }
+    
+    const { data, contentType } = userProfile.profileImage;
+    
+    // Handle MongoDB Binary data
+    const imageBuffer = data.buffer ? Buffer.from(data.buffer) : data;
+    
+    console.log('Serving image for user:', userId, 'Size:', imageBuffer.length, 'Type:', contentType);
+    
+    res.set({
+      'Content-Type': contentType,
+      'Content-Length': imageBuffer.length,
+      'Cache-Control': 'public, max-age=86400', // Cache for 24 hours
+      'ETag': userProfile.profileImage.hash
+    });
+    
+    res.send(imageBuffer);
+  } catch (error) {
+    console.error('Error serving profile image:', error);
+    res.status(500).json({ error: 'Failed to serve profile image' });
   }
 });
 
